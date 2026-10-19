@@ -195,13 +195,19 @@ const registerExtractionCommand = (
     args: z.object({
       path: z.string().describe("Application or package path"),
     }),
-    options: z.object({}),
-    run: ({ args }) =>
+    options: z.object({
+      integrityPolicy: z
+        .enum(["fail", "record-and-continue"])
+        .default("fail")
+        .describe("Behavior when declared artifact integrity does not match"),
+    }),
+    run: ({ args, options }) =>
       logCliCommand(logger, "extract-artifact", () =>
         runProviderAnalysis(
           args.path,
           "extract_artifact",
           {
+            integrity_policy: options.integrityPolicy,
             output_root: createArtifactExtractionDestination(),
           },
           logger,
@@ -219,7 +225,7 @@ const registerInspectionCommand = (
     description:
       "Inspect one artifact and return all available observations and next probes",
     args: z.object({
-      path: z.string().describe("Application or package path"),
+      path: z.string().min(1).describe("Application or package path"),
     }),
     options: z.object({
       integrityPolicy: z

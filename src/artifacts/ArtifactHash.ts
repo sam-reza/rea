@@ -3,16 +3,16 @@ import type { Readable } from "node:stream";
 
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import { streamChunkToBuffer } from "./StreamBytes.js";
+import {
+  createArtifactClassificationProbe,
+  type ArtifactClassificationEvidence,
+} from "./ArtifactClassificationProbe.js";
 
 /** Full stream digest and byte count with bounded classification evidence. */
-export type HashResult = {
+export type HashResult = ArtifactClassificationEvidence & {
   readonly sha256: string;
   readonly bytes: number;
-  readonly prefix: Buffer;
 };
-
-/** Bounded classification evidence; this is not an executable format size limit. */
-export const ARTIFACT_CLASSIFICATION_PREFIX_BYTES = 8_192;
 
 /** Preserve the inventory cancellation reason at a stream boundary. */
 export const abortIfNeeded = (signal?: AbortSignal): void => {
@@ -20,6 +20,7 @@ export const abortIfNeeded = (signal?: AbortSignal): void => {
     throw new ArtifactReaderFailure(
       "cancelled",
       "Artifact inventory cancelled",
+      { cause: signal.reason },
     );
 };
 
@@ -29,22 +30,15 @@ export const hashReadable = async (
   signal?: AbortSignal,
 ): Promise<HashResult> => {
   const hash = createHash("sha256");
-  const prefixes: Buffer[] = [];
-  let prefixBytes = 0;
+  const probe = createArtifactClassificationProbe();
   let bytes = 0;
   for await (const raw of stream) {
     abortIfNeeded(signal);
     const chunk = streamChunkToBuffer(raw);
     bytes += chunk.length;
     hash.update(chunk);
-    if (prefixBytes < ARTIFACT_CLASSIFICATION_PREFIX_BYTES) {
-      const selected = chunk.subarray(
-        0,
-        ARTIFACT_CLASSIFICATION_PREFIX_BYTES - prefixBytes,
-      );
-      prefixes.push(selected);
-      prefixBytes += selected.length;
-    }
+    probe.write(chunk);
   }
-  return { sha256: hash.digest("hex"), bytes, prefix: Buffer.concat(prefixes) };
+  abortIfNeeded(signal);
+  return { sha256: hash.digest("hex"), bytes, ...probe.finish(bytes) };
 };

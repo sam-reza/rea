@@ -4,7 +4,7 @@ import { logicalPathNfc } from "../domain/artifactIdentity.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 
-const DRIVE_OR_UNC = /^(?:[A-Za-z]:|\\|\/\/)/u;
+const DRIVE_PREFIX = /^[A-Za-z]:/u;
 
 /**
  * English Unicode case folding used only to describe logical names a
@@ -20,14 +20,9 @@ export const ENGLISH_UNICODE_CASE_INVENTORY_LIMITATION = `Logical archive names 
 export const DESTINATION_CASE_COLLISION_PREFIX =
   "Destination filesystem cannot store both ";
 
-/** Normalize an untrusted logical archive path without touching filesystem. */
+/** Normalize slash-separated logical names; backslashes are literal components. */
 export const normalizeArtifactPath = (input: string): string => {
-  if (
-    input.includes("\0") ||
-    input.includes("\\") ||
-    input.startsWith("/") ||
-    DRIVE_OR_UNC.test(input)
-  )
+  if (input.includes("\0") || input.startsWith("/") || DRIVE_PREFIX.test(input))
     throw new ArtifactReaderFailure(
       "path",
       `Artifact path is absolute or unsafe: ${JSON.stringify(input)}`,
@@ -66,7 +61,7 @@ export class ArtifactPathRegistry {
       }
       node = child;
       if (index === parts.length - 1) {
-        if (node.kind !== undefined)
+        if (node.kind !== undefined && node.kind !== kind)
           throw new ArtifactReaderFailure(
             "path",
             `Artifact path collision: ${path}`,
@@ -177,12 +172,12 @@ const englishUnicodeCaseCollisions = (
     if (path.length === 0 || path === ".") continue;
     let node = root;
     for (const part of path.split("/")) {
-      const folded = englishCaseFold(part);
-      const spellings = node.spellingsByFold.get(folded);
-      if (spellings === undefined) node.spellingsByFold.set(folded, [part]);
-      else if (!spellings.includes(part)) spellings.push(part);
       let child = node.bySpelling.get(part);
       if (child === undefined) {
+        const folded = englishCaseFold(part);
+        const spellings = node.spellingsByFold.get(folded);
+        if (spellings === undefined) node.spellingsByFold.set(folded, [part]);
+        else spellings.push(part);
         child = emptyCaseNode();
         node.bySpelling.set(part, child);
       }

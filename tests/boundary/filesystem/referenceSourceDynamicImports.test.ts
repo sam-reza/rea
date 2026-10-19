@@ -3,8 +3,8 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { importReferenceSource } from "../../../src/application/ReferenceSourceImport.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { importReferenceSource } from "../../support/referenceSourceResourceScope.js";
 
 it("resolves dynamic source imports while retaining computed targets as unknown", async () => {
   const root = await createTestTempDirectory("rea-reference-dynamic-import-");
@@ -62,4 +62,47 @@ it("resolves dynamic source imports while retaining computed targets as unknown"
     resolution: "external",
     parse_state: "parsed",
   });
+});
+
+it("loads an extensionless JSON target only through CommonJS require", async () => {
+  const root = await createTestTempDirectory("rea-reference-json-require-");
+  await Promise.all([
+    writeFile(join(root, "main.cjs"), 'require("./data");\n'),
+    writeFile(join(root, "main.mjs"), 'import "./data";\n'),
+    writeFile(join(root, "data.json"), '{"value":1}\n'),
+  ]);
+
+  const result = await importReferenceSource({
+    root,
+    caller: "reference-json-require-test",
+    policy: { secretPatterns: [] },
+  });
+  if (!result.ok) throw result.error;
+  // ESM, unlike the CommonJS loader, requires the explicit `.json` extension.
+  expect(result.value.relationships).toEqual([
+    {
+      from_path: "main.cjs",
+      to: "data.json",
+      kind: "requires",
+      resolution: "internal",
+      parse_state: "parsed",
+    },
+    {
+      from_path: "main.mjs",
+      to: "data",
+      kind: "imports",
+      resolution: "unresolved",
+      parse_state: "parsed",
+    },
+  ]);
+  expect(
+    result.value.entries.map((entry) => [
+      entry.path,
+      "content_state" in entry ? entry.content_state : null,
+    ]),
+  ).toEqual([
+    ["data.json", "hashed"],
+    ["main.cjs", "hashed"],
+    ["main.mjs", "hashed"],
+  ]);
 });

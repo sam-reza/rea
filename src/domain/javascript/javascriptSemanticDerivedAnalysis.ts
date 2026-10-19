@@ -3,11 +3,12 @@ import type * as t from "@babel/types";
 import { collectJavaScriptSemanticAsyncEffects } from "./javascriptSemanticAsyncEffects.js";
 import { collectJavaScriptSemanticCalls } from "./javascriptSemanticCalls.js";
 import { collectJavaScriptSemanticChildProcesses } from "./javascriptSemanticChildProcesses.js";
-import { collectJavaScriptSemanticFingerprints } from "./javascriptSemanticFingerprints.js";
+import { collectJavaScriptSemanticFingerprintsSteps } from "./javascriptSemanticFingerprints.js";
 import { collectJavaScriptSemanticDataEffects } from "./javascriptSemanticDataEffects.js";
 import type {
   JavaScriptSemanticCallable,
   JavaScriptSemanticIr,
+  JavaScriptSemanticReference,
 } from "./javascriptSemanticIr.js";
 import { collectJavaScriptSemanticPromises } from "./javascriptSemanticPromises.js";
 import { collectJavaScriptSemanticObjects } from "./javascriptSemanticObjects.js";
@@ -44,6 +45,7 @@ export function* collectJavaScriptDerivedSemanticsSteps(
   program: t.Program,
   state: JavaScriptSemanticAnalysisState,
   callables: readonly JavaScriptSemanticCallable[],
+  references: readonly JavaScriptSemanticReference[],
   parserPartial: boolean,
 ): Generator<void, DerivedSemanticAnalysis> {
   const calls = collectJavaScriptSemanticCalls(program, state, callables);
@@ -84,19 +86,20 @@ export function* collectJavaScriptDerivedSemanticsSteps(
     callables,
   );
   yield;
-  const functionFingerprints = collectJavaScriptSemanticFingerprints({
-    state,
-    callables,
-    calls,
-    promises: promiseOperations,
-    events: asyncEffects.eventOperations,
-    timers: asyncEffects.timerOperations,
-    childProcessSpawns: childProcesses.childProcessSpawns,
-    childProcessInteractions: childProcesses.childProcessInteractions,
-    requestOperations: dataEffects.requestOperations,
-    resourceOperations,
-    parserPartial,
-  });
+  const functionFingerprints =
+    yield* collectJavaScriptSemanticFingerprintsSteps({
+      state,
+      callables,
+      calls,
+      promises: promiseOperations,
+      events: asyncEffects.eventOperations,
+      timers: asyncEffects.timerOperations,
+      childProcessSpawns: childProcesses.childProcessSpawns,
+      childProcessInteractions: childProcesses.childProcessInteractions,
+      requestOperations: dataEffects.requestOperations,
+      resourceOperations,
+      parserPartial,
+    });
   return {
     ...calls,
     promiseOperations,

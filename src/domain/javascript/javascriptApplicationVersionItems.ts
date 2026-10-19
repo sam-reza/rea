@@ -23,13 +23,26 @@ interface ItemContext {
   readonly rightGraph: JavaScriptApplicationGraph;
   readonly leftEvidenceId: string;
   readonly rightEvidenceId: string;
-  readonly leftNativeEvidence: readonly Evidence[];
-  readonly rightNativeEvidence: readonly Evidence[];
+  readonly leftNativeEvidenceByDigest: ReadonlyMap<string, readonly string[]>;
+  readonly rightNativeEvidenceByDigest: ReadonlyMap<string, readonly string[]>;
   readonly pairByLeft: ReadonlyMap<string, string>;
   readonly pairByRight: ReadonlyMap<string, string>;
   readonly leftRelationships: RelationshipIndex;
   readonly rightRelationships: RelationshipIndex;
 }
+
+type ItemContextInput = Omit<
+  ItemContext,
+  | "leftNativeEvidenceByDigest"
+  | "rightNativeEvidenceByDigest"
+  | "pairByLeft"
+  | "pairByRight"
+  | "leftRelationships"
+  | "rightRelationships"
+> & {
+  readonly leftNativeEvidence: readonly Evidence[];
+  readonly rightNativeEvidence: readonly Evidence[];
+};
 
 interface IndexedRelationship {
   readonly direction: "in" | "out";
@@ -66,10 +79,7 @@ type ComparisonItemSemantic<
 /** Classify matched, unmatched, and ambiguous nodes without inventing absence. */
 export const classifyJavaScriptApplicationVersions = (
   matching: ApplicationVersionMatchingProjection,
-  context: Omit<
-    ItemContext,
-    "pairByLeft" | "pairByRight" | "leftRelationships" | "rightRelationships"
-  >,
+  context: ItemContextInput,
 ): ApplicationVersionItemProjection => {
   const pairByLeft = new Map(
     matching.pairs.map(({ left, right }) => [
@@ -84,7 +94,14 @@ export const classifyJavaScriptApplicationVersions = (
     ]),
   );
   const fullContext: ItemContext = {
-    ...context,
+    leftGraph: context.leftGraph,
+    rightGraph: context.rightGraph,
+    leftEvidenceId: context.leftEvidenceId,
+    rightEvidenceId: context.rightEvidenceId,
+    leftNativeEvidenceByDigest: indexNativeEvidence(context.leftNativeEvidence),
+    rightNativeEvidenceByDigest: indexNativeEvidence(
+      context.rightNativeEvidence,
+    ),
     pairByLeft,
     pairByRight,
     leftRelationships: indexRelationships(context.leftGraph),
@@ -125,19 +142,23 @@ const matchedItem = (
   pair: ApplicationVersionNodePair,
   context: ItemContext,
 ): ApplicationVersionComparisonItem => {
-  const dimensions = changedDimensions(pair, context);
+  const relationships = compareRelationships(pair, context);
+  const dimensions = changedDimensions(pair, relationships);
   const complete = graphsComplete(context);
-  const observedChange = dimensions.some((dimension) =>
-    ["content", "location", "properties"].includes(dimension),
-  );
+  const observedChange =
+    dimensions.includes("content") || dimensions.includes("properties");
+  // Coordinates remain comparison evidence; relocation alone is not a
+  // content, property, or relationship change.
+  const completeChange =
+    complete && dimensions.some((dimension) => dimension !== "location");
   const status: ApplicationVersionComparisonItem["status"] =
-    observedChange || (complete && dimensions.length > 0)
+    observedChange || completeChange
       ? "changed"
-      : complete
+      : complete && !relationships.unresolved
         ? "unchanged"
         : "unknown";
   const finalDimensions =
-    status === "unknown" && !dimensions.includes("coverage")
+    status === "unknown" && !complete
       ? [...dimensions, "coverage" as const]
       : dimensions;
   const semantic: ComparisonItemSemantic = {
@@ -148,7 +169,19 @@ const matchedItem = (
     match: matchedMatch(pair),
     dimensions: finalDimensions,
     evidence_links: itemEvidenceLinks(pair.left, pair.right, context),
-    limitations: pairLimitations(pair, status),
+    limitations: [
+      ...matchLimitations(pair),
+      ...(status === "unknown" && !complete
+        ? [
+            "Incomplete graph coverage prevents a complete node-level conclusion.",
+          ]
+        : []),
+      ...(relationships.unresolved
+        ? [
+            "Relationship target identity remains unresolved; equal node kinds do not establish cross-version alignment.",
+          ]
+        : []),
+    ],
   };
   return itemWithId(semantic);
 };
@@ -300,7 +333,7 @@ const INCOMPLETE_GRAPH_LIMITATION =
 
 const changedDimensions = (
   pair: ApplicationVersionNodePair,
-  context: ItemContext,
+  relationships: RelationshipComparison,
 ): ApplicationVersionComparisonItem["dimensions"] => {
   const dimensions: ApplicationVersionComparisonItem["dimensions"] = [];
   const leftContent = contentIdentity(pair.left);
@@ -320,11 +353,7 @@ const changedDimensions = (
     canonicalJson(properties(pair.right))
   )
     dimensions.push("properties");
-  if (
-    relationshipSignature(pair.left, "left", context) !==
-    relationshipSignature(pair.right, "right", context)
-  )
-    dimensions.push("relationships");
+  if (relationships.different) dimensions.push("relationships");
   return dimensions;
 };
 
@@ -389,32 +418,56 @@ const indexRelationships = (
   };
 };
 
-const relationshipSignature = (
+/** Positive topology differences and unresolved neighbor identity are independent facts. */
+interface RelationshipComparison {
+  readonly different: boolean;
+  readonly unresolved: boolean;
+}
+
+const compareRelationships = (
+  pair: ApplicationVersionNodePair,
+  context: ItemContext,
+): RelationshipComparison => {
+  const left = relationshipFacts(pair.left, "left", context);
+  const right = relationshipFacts(pair.right, "right", context);
+  return {
+    different:
+      left.paired !== right.paired ||
+      left.unpairedShape !== right.unpairedShape,
+    unresolved: left.unresolved || right.unresolved,
+  };
+};
+
+const relationshipFacts = (
   node: ApplicationNode,
   side: "left" | "right",
   context: ItemContext,
-): string => {
+): {
+  readonly paired: string;
+  readonly unpairedShape: string;
+  readonly unresolved: boolean;
+} => {
   const { nodeById, adjacency } =
     side === "left" ? context.leftRelationships : context.rightRelationships;
   const paired = side === "left" ? context.pairByLeft : context.pairByRight;
-  const signatures = (adjacency.get(node.node_id) ?? []).map((relationship) =>
-    edgeSignature({ ...relationship, paired, nodeById }),
-  );
-  return canonicalJson(signatures.sort(compareUnicodeCodePoints));
-};
-
-interface EdgeSignatureContext {
-  readonly direction: "in" | "out";
-  readonly relation: ApplicationEdge["relation"];
-  readonly neighborId: string;
-  readonly paired: ReadonlyMap<string, string>;
-  readonly nodeById: ReadonlyMap<string, ApplicationNode>;
-}
-
-const edgeSignature = (context: EdgeSignatureContext): string => {
-  const mapped = context.paired.get(context.neighborId);
-  const neighbor = context.nodeById.get(context.neighborId);
-  return `${context.direction}\0${context.relation}\0${mapped ?? `unmatched:${neighbor?.kind ?? "unknown"}`}`;
+  const matched: string[] = [];
+  const unpaired: string[] = [];
+  for (const { direction, relation, neighborId } of adjacency.get(
+    node.node_id,
+  ) ?? []) {
+    const mapped = paired.get(neighborId);
+    if (mapped !== undefined)
+      matched.push(`${direction}\0${relation}\0${mapped}`);
+    else
+      unpaired.push(
+        `${direction}\0${relation}\0${nodeById.get(neighborId)?.kind ?? "unknown"}`,
+      );
+  }
+  return {
+    paired: canonicalJson(matched.sort(compareUnicodeCodePoints)),
+    unpairedShape: canonicalJson(unpaired.sort(compareUnicodeCodePoints)),
+    unresolved: unpaired.length > 0,
+  };
 };
 
 const itemEvidenceLinks = (
@@ -426,30 +479,36 @@ const itemEvidenceLinks = (
     ...new Set([
       context.leftEvidenceId,
       context.rightEvidenceId,
-      ...nativeLinks(left, context.leftNativeEvidence),
-      ...nativeLinks(right, context.rightNativeEvidence),
+      ...nativeLinks(left, context.leftNativeEvidenceByDigest),
+      ...nativeLinks(right, context.rightNativeEvidenceByDigest),
     ]),
   ].sort(compareUnicodeCodePoints);
 
 const nativeLinks = (
   node: ApplicationNode | undefined,
-  evidence: readonly Evidence[],
-): string[] => {
-  const digest =
-    node === undefined
-      ? null
-      : contentIdentity(node)?.replace(/^content:/u, "");
-  return digest === null
-    ? []
-    : evidence
-        .filter(({ subject }) => subject?.digest.sha256 === digest)
-        .map(({ evidence_id: id }) => id);
+  evidenceByDigest: ReadonlyMap<string, readonly string[]>,
+): readonly string[] => {
+  const identity = node === undefined ? null : contentIdentity(node);
+  if (identity === null) return [];
+  const digest = identity.replace(/^content:/u, "");
+  return evidenceByDigest.get(digest) ?? [];
 };
 
-const pairLimitations = (
-  pair: ApplicationVersionNodePair,
-  status: ApplicationVersionComparisonItem["status"],
-): string[] => [
+const indexNativeEvidence = (
+  evidence: readonly Evidence[],
+): ReadonlyMap<string, readonly string[]> => {
+  const evidenceByDigest = new Map<string, string[]>();
+  for (const { evidence_id: id, subject } of evidence) {
+    const digest = subject?.digest.sha256;
+    if (digest === undefined) continue;
+    const ids = evidenceByDigest.get(digest);
+    if (ids === undefined) evidenceByDigest.set(digest, [id]);
+    else ids.push(id);
+  }
+  return evidenceByDigest;
+};
+
+const matchLimitations = (pair: ApplicationVersionNodePair): string[] => [
   ...(pair.basis === "structural-fingerprint"
     ? [
         "Structural fingerprint equality is rename-resistant inference; it is not byte identity or proof of semantic equivalence.",
@@ -464,9 +523,6 @@ const pairLimitations = (
     ? [
         "Semantic-key pairing is a deterministic inference and is never promoted to exact identity.",
       ]
-    : []),
-  ...(status === "unknown"
-    ? ["Incomplete graph coverage prevents a complete node-level conclusion."]
     : []),
 ];
 

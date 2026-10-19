@@ -53,7 +53,9 @@ export const captureWebExecution = async (
     const reason = await waiting;
     session.beginCompletion();
     if (session.options.signal?.aborted)
-      throw new AnalysisCancelledError(session.operation);
+      throw new AnalysisCancelledError(session.operation, {
+        cause: session.options.signal.reason,
+      });
     sources.check();
     requests.check();
     let raw: unknown;
@@ -94,9 +96,9 @@ export const captureWebExecution = async (
       sources.belongsToDocument(id),
     );
     const sample =
-      raw === undefined
-        ? undefined
-        : normalizePreciseCoverage(raw, sources, retained);
+      parsed?.success === true
+        ? normalizePreciseCoverage(parsed.data, sources, retained)
+        : undefined;
     await session.options.progress?.report({
       phase: "browser_execution",
       completed: 2,

@@ -16,29 +16,41 @@ import { classifyFilesystemEffects } from "./ProcessFilesystemEffects.js";
 it.each(["after", "before"] as const)(
   "keeps absence unknown when the %s snapshot omits an existing file",
   async (partialSide) => {
+    // Enumeration order is filesystem-dependent. Choose a genuinely omitted
+    // entry by comparing a complete snapshot with a capacity-limited one.
     const root = await createTestTempDirectory("rea-fs-partial-absence-");
-    await writeFile(join(root, "z.txt"), "unchanged");
+    await writeFile(join(root, "a1.txt"), "first");
+    await writeFile(join(root, "a2.txt"), "second");
+    await writeFile(join(root, "z.txt"), "target");
     const scenario = parseProcessScenario({
       executable: process.execPath,
       working_directory: root,
       filesystem_observation_paths: [root],
       limits: { files: 2 },
     });
-    if (partialSide === "before") await writeFile(join(root, "a.txt"), "other");
-    const before = await snapshotRoots(scenario);
-    if (partialSide === "after") await writeFile(join(root, "a.txt"), "other");
-    else await rm(join(root, "a.txt"));
-    const after = await snapshotRoots(scenario);
-    expect(await readFile(join(root, "z.txt"), "utf8")).toBe("unchanged");
+    const complete = await snapshotRoots({
+      ...scenario,
+      limits: { ...scenario.limits, files: 4 },
+    });
+    const partial = await snapshotRoots(scenario);
+    expect(complete.completeRoots).toEqual(["root_0"]);
+    expect(partial.truncated).toBe(true);
+    const omitted = complete.files.find(
+      (file) => !partial.files.some(({ path }) => path === file.path),
+    );
+    if (omitted === undefined) throw new Error("Expected an omitted entry");
+    const before = partialSide === "before" ? partial : complete;
+    const after = partialSide === "after" ? partial : complete;
     const effect = classifyFilesystemEffects(before, after).find(
-      ({ path }) => path === "root_0:z.txt",
+      ({ path }) => path === omitted.path,
     );
     expect(effect?.status).toBe("unknown");
-    expect(effect).toMatchObject(
-      partialSide === "after"
-        ? { before: { path: "root_0:z.txt" }, after: null }
-        : { before: null, after: { path: "root_0:z.txt" } },
-    );
+    expect(effect).toMatchObject({
+      ...(partialSide === "after"
+        ? { before: omitted, after: null }
+        : { before: null, after: omitted }),
+      reason: expect.stringContaining("did not exhaust path enumeration"),
+    });
   },
 );
 
@@ -87,6 +99,45 @@ it("distinguishes unavailable content hashes from completed path enumeration", a
     ),
   ).toMatchObject({ status: "deleted", before: { sha256: null }, after: null });
 });
+
+it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+  "retains readable entries and marks an unreadable directory subtree unknown",
+  async () => {
+    const root = await createTestTempDirectory("rea-fs-unreadable-directory-");
+    const visible = join(root, "a-visible.txt");
+    const blocked = join(root, "z-blocked");
+    await writeFile(visible, "visible");
+    await mkdir(blocked);
+    await chmod(blocked, 0);
+    const scenario = parseProcessScenario({
+      executable: process.execPath,
+      working_directory: root,
+      filesystem_observation_paths: [root],
+    });
+
+    try {
+      const snapshot = await snapshotRoots(scenario);
+      expect(snapshot.files.map(({ path }) => path)).toContain(
+        "root_0:a-visible.txt",
+      );
+      expect(snapshot.files.map(({ path }) => path)).toContain(
+        "root_0:z-blocked",
+      );
+      expect(snapshot.completeRoots).toEqual([]);
+      expect(snapshot.coverage.enumeration_omissions).toEqual([
+        {
+          path: "root_0:z-blocked",
+          reason: "directory_unavailable",
+          system_code: "EACCES",
+        },
+      ]);
+      expect(snapshot.truncated).toBe(true);
+    } finally {
+      await chmod(blocked, 0o700);
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
   "retains unreadable-file and sibling observations in a complete snapshot",
@@ -284,6 +335,38 @@ it.skipIf(process.platform === "win32")(
       ).toBe("unchanged");
     expect(
       effects.find(({ path }) => path === "root_0:moved-link")?.status,
+    ).toBe("modified");
+  },
+);
+
+it.skipIf(process.platform === "win32")(
+  "keeps the observed symlink target when dot segments resolve to the same path",
+  async () => {
+    const root = await createTestTempDirectory("rea-fs-symlink-spelling-");
+    await mkdir(join(root, "aaa"));
+    await writeFile(join(root, "target"), "content");
+    // Equal length, so only the target spelling distinguishes the links;
+    // "bbb" does not exist, so the replacement link is broken.
+    await symlink("aaa/../target", join(root, "link"));
+    const scenario = parseProcessScenario({
+      executable: process.execPath,
+      working_directory: root,
+      filesystem_observation_paths: [root],
+      limits: { file_bytes: 1 },
+    });
+    const before = await snapshotRoots(scenario);
+    await rm(join(root, "link"));
+    await symlink("bbb/../target", join(root, "link"));
+    const after = await snapshotRoots(scenario);
+
+    const link = (snapshot: typeof before) =>
+      snapshot.files.find(({ path }) => path === "root_0:link");
+    expect(link(before)?.symlink_target).toBe("aaa/../target");
+    expect(link(after)?.symlink_target).toBe("bbb/../target");
+    expect(
+      classifyFilesystemEffects(before, after).find(
+        ({ path }) => path === "root_0:link",
+      )?.status,
     ).toBe("modified");
   },
 );

@@ -19,15 +19,12 @@ import {
   JAVASCRIPT_SEMANTIC_RELATION_FAMILIES,
   JAVASCRIPT_SEMANTIC_RELATION_FAMILY,
   javaScriptSemanticFingerprintInputSchema,
-  javaScriptSemanticFingerprintSchema,
+  javaScriptSemanticEvidenceContextSchema,
   javaScriptSemanticGraphInputSchema,
   javaScriptSemanticGraphRecordSchema,
   javaScriptSemanticNodeInputSchema,
-  javaScriptSemanticNodeSchema,
   javaScriptSemanticRelationInputSchema,
-  javaScriptSemanticRelationSchema,
   javaScriptSemanticUnknownInputSchema,
-  javaScriptSemanticUnknownSchema,
   type JavaScriptSemanticGraphInput,
   type JavaScriptSemanticGraphNode,
   type JavaScriptSemanticGraphRelation,
@@ -113,6 +110,33 @@ export class JavaScriptSemanticEvidenceContextRegistry {
     this.#contexts.clear();
     this.#idsByCanonicalContext.clear();
   }
+
+  /** Validate and intern provenance decoded in this realm from an analysis worker. */
+  adopt(input: unknown): void {
+    const context = javaScriptSemanticEvidenceContextSchema.parse(input);
+    const { context_id: identifier, ...value } = context;
+    if (identifier !== evidenceContextId(value))
+      throw new TypeError(
+        "Transferred semantic evidence context identifier is stale",
+      );
+    const canonical = canonicalJson(
+      value,
+      "JavaScript semantic evidence context",
+    );
+    const existing = this.#contexts.get(identifier);
+    if (existing !== undefined) {
+      const { context_id: _existingIdentifier, ...existingValue } = existing;
+      if (
+        canonical !==
+        canonicalJson(existingValue, "JavaScript semantic evidence context")
+      )
+        throw new TypeError(
+          "Transferred semantic evidence context digest collision",
+        );
+    }
+    this.#contexts.set(identifier, context);
+    this.#idsByCanonicalContext.set(canonical, identifier);
+  }
 }
 
 /** Derive a semantic node ID from its kind and exact artifact identity. */
@@ -132,10 +156,10 @@ export const createJavaScriptSemanticGraphNode = (
     application_node_ids: uniqueSorted(parsed.application_node_ids),
     evidence: evidenceContexts.intern(parsed.evidence),
   };
-  return javaScriptSemanticNodeSchema.parse({
+  return {
     ...semantic,
     node_id: javaScriptSemanticNodeId(semantic),
-  });
+  };
 };
 
 /** Normalize one semantic relationship and derive its exact identifier. */
@@ -148,10 +172,10 @@ export const createJavaScriptSemanticGraphRelation = (
     ...parsed,
     evidence: evidenceContexts.intern(parsed.evidence),
   };
-  return javaScriptSemanticRelationSchema.parse({
+  return {
     ...semantic,
     relation_id: `jsrg_relation_${digestCanonicalValue(semantic, "JavaScript semantic graph")}`,
-  });
+  };
 };
 
 /** Normalize one unresolved semantic frontier and derive its identifier. */
@@ -166,10 +190,10 @@ export const createJavaScriptSemanticGraphUnknown = (
     candidate_node_ids: uniqueSorted(parsed.candidate_node_ids),
     evidence: evidenceContexts.intern(parsed.evidence),
   };
-  return javaScriptSemanticUnknownSchema.parse({
+  return {
     ...semantic,
     unknown_id: `jsrg_unknown_${digestCanonicalValue(semantic, "JavaScript semantic graph")}`,
-  });
+  };
 };
 
 /** Normalize one function fingerprint and derive its component commitment. */
@@ -191,7 +215,7 @@ export const createJavaScriptSemanticFingerprint = (
     semantic.components,
     "JavaScript semantic graph",
   );
-  return javaScriptSemanticFingerprintSchema.parse({
+  return {
     ...semantic,
     fingerprint_sha256: fingerprintSha256,
     fingerprint_id: `jsrg_fingerprint_${digestCanonicalValue(
@@ -202,7 +226,7 @@ export const createJavaScriptSemanticFingerprint = (
       },
       "JavaScript semantic graph",
     )}`,
-  });
+  };
 };
 
 type GraphRecord = z.infer<typeof javaScriptSemanticGraphRecordSchema>;
@@ -241,6 +265,22 @@ function* checkCoverageSteps(
   graph: GraphRecord,
   context: GraphIssueReporter,
 ): Generator<void> {
+  const omittedUnknowns = graph.coverage.omitted_unknown_occurrences ?? [];
+  sortedUniqueIssue(
+    omittedUnknowns.map(({ family, reason }) => `${family}:${reason}`),
+    ["coverage", "omitted_unknown_occurrences"],
+    "Unknown omission coverage",
+    context,
+  );
+  if (
+    omittedUnknowns.length > 0 &&
+    (!graph.coverage.truncated || graph.coverage.status !== "partial")
+  )
+    context.addIssue({
+      code: "custom",
+      path: ["coverage"],
+      message: "Omitted unknown occurrences require truncated partial coverage",
+    });
   const families = graph.coverage.families.map(({ family }) => family);
   if (
     canonicalJson(families, "JavaScript semantic graph") !==
@@ -282,9 +322,11 @@ function* checkCoverageSteps(
     relationsByFamily.set(family, (relationsByFamily.get(family) ?? 0) + 1);
   }
   const unknownsById = new Map<string, GraphRecord["unknowns"][number]>();
+  const unknownFamilies = new Set<string>();
   for (const [index, unknown] of graph.unknowns.entries()) {
     if (index % 256 === 0) yield;
     unknownsById.set(unknown.unknown_id, unknown);
+    unknownFamilies.add(unknown.family);
   }
   for (const [index, family] of graph.coverage.families.entries()) {
     if (family.retained_relations !== relationsByFamily.get(family.family))
@@ -305,7 +347,10 @@ function* checkCoverageSteps(
       });
     if (
       family.status === "complete" &&
-      (family.omitted_relations !== 0 || family.unknown_ids.length > 0)
+      (family.omitted_relations !== 0 ||
+        family.unknown_ids.length > 0 ||
+        unknownFamilies.has(family.family) ||
+        omittedUnknowns.some((omitted) => omitted.family === family.family))
     )
       context.addIssue({
         code: "custom",
@@ -731,6 +776,18 @@ const normalizeGraphInput = (
         canonicalJson(right, "JavaScript semantic graph"),
       ),
     ),
+    ...(parsed.coverage.omitted_unknown_occurrences === undefined
+      ? {}
+      : {
+          omitted_unknown_occurrences: [
+            ...parsed.coverage.omitted_unknown_occurrences,
+          ].sort((left, right) =>
+            compareUnicodeCodePoints(
+              `${left.family}:${left.reason}`,
+              `${right.family}:${right.reason}`,
+            ),
+          ),
+        }),
     families: [...parsed.coverage.families]
       .map((family) => ({
         ...family,

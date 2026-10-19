@@ -6,6 +6,8 @@ import {
   AnalysisOutputError,
   AnalysisCapabilityUnavailableError,
   AnalysisResourceConstraintError,
+  AnalysisCancelledError,
+  AnalysisTimeoutError,
 } from "./analysisErrorCore.js";
 import { redactExplicitText } from "./explicitSensitiveValues.js";
 import type { JsonValue } from "./jsonValue.js";
@@ -38,6 +40,18 @@ export const redactExplicitFailure = (
   values: readonly string[],
 ): AnalysisError => {
   if (values.length === 0) return error;
+  const redacted = redactFailure(error, values);
+  return redacted === error
+    ? error
+    : mirrorCleanup(error, redacted, (value) =>
+        redactExplicitText(value, values),
+      );
+};
+
+const redactFailure = (
+  error: AnalysisError,
+  values: readonly string[],
+): AnalysisError => {
   const text = (value: string): string => redactExplicitText(value, values);
   const path = (
     parts: readonly (string | number)[],
@@ -72,24 +86,63 @@ export const redactExplicitFailure = (
     if (typeof value === "object" && value !== null) return diagnostics(value);
     return value;
   };
+  const context = {
+    cause: error,
+    ...(error.cleanupPrimary === undefined
+      ? {}
+      : {
+          cleanupPrimary: redactExplicitFailure(error.cleanupPrimary, values),
+        }),
+    ...(error.diagnostics === undefined
+      ? {}
+      : { diagnostics: diagnostics(error.diagnostics) }),
+    ...(error.capturedOutput === undefined
+      ? {}
+      : {
+          capturedOutput: {
+            ...error.capturedOutput,
+            stdout: text(error.capturedOutput.stdout),
+            stderr: text(error.capturedOutput.stderr),
+          },
+        }),
+    ...(error.cleanup === undefined
+      ? {}
+      : {
+          cleanup: {
+            reason: text(error.cleanup.reason),
+            resources: error.cleanup.resources.map(text),
+          },
+        }),
+  };
+  if (error instanceof AnalysisCancelledError)
+    return new AnalysisCancelledError(error.operation, {
+      ...context,
+      cause: error.cause,
+      partialObservation: error.partialObservation,
+    });
+  if (error instanceof AnalysisTimeoutError)
+    return new AnalysisTimeoutError(error.operation, error.timeoutMs, {
+      ...context,
+      partialObservation: error.partialObservation,
+    });
   if (error instanceof AnalysisAccessDeniedError)
     return new AnalysisAccessDeniedError(
       error.operation,
       text(error.path),
       error.systemCode,
-      { cause: error },
+      context,
     );
   if (error instanceof AnalysisArtifactChangedError)
     return new AnalysisArtifactChangedError(
       error.operation,
       text(error.path),
       text(error.reason),
-      { cause: error },
+      context,
     );
   if (error instanceof AnalysisInputError)
     return new AnalysisInputError(
       error.operation,
-      { cause: error },
+      context,
       error.issues.map((issue) => ({
         ...issue,
         // Unknown-argument paths contain literal field names, including names
@@ -104,19 +157,22 @@ export const redactExplicitFailure = (
       })),
     );
   if (error instanceof AnalysisOutputError)
-    return new AnalysisOutputError(error.operation, text(error.reason), {
-      cause: error,
-    });
+    return new AnalysisOutputError(
+      error.operation,
+      text(error.reason),
+      context,
+    );
   if (error instanceof AnalysisCapabilityUnavailableError)
     return new AnalysisCapabilityUnavailableError(
       error.providerId,
       error.operation,
       text(error.reason),
       {
-        cause: error,
+        ...context,
         ...(error.userMessage === undefined
           ? {}
           : { userMessage: text(error.userMessage) }),
+        ...(error.retryable ? { retryable: true } : {}),
       },
     );
   if (error instanceof AnalysisResourceConstraintError)
@@ -126,19 +182,13 @@ export const redactExplicitFailure = (
       text(error.reason),
       error.reportedLimits === null ? null : diagnostics(error.reportedLimits),
       {
-        cause: error,
+        ...context,
         ...(error.remediationAction === undefined
           ? {}
           : { remediationAction: text(error.remediationAction) }),
-        ...(error.capturedOutput === undefined
+        ...(error.retryable === undefined
           ? {}
-          : {
-              capturedOutput: {
-                stdout: text(error.capturedOutput.stdout),
-                stderr: text(error.capturedOutput.stderr),
-                truncated: error.capturedOutput.truncated,
-              },
-            }),
+          : { retryable: error.retryable }),
       },
     );
   if (error instanceof ProviderCleanupError)
@@ -146,14 +196,37 @@ export const redactExplicitFailure = (
       error.providerId,
       error.cleanupResources.map(text),
       diagnostics(error.diagnostics ?? {}),
-      { operation: error.operation, cause: error },
+      {
+        ...context,
+        operation: error.operation,
+        ...(error.partialObservation === undefined
+          ? {}
+          : { partialObservation: error.partialObservation }),
+      },
     );
   if (error instanceof ProviderAdapterError)
     return new ProviderAdapterError(error.providerId, error.operation, {
-      cause: error,
-      ...(error.diagnostics === undefined
+      ...context,
+      ...(error.partialObservation === undefined
         ? {}
-        : { diagnostics: diagnostics(error.diagnostics) }),
+        : { partialObservation: error.partialObservation }),
+      ...(error.userMessage === undefined
+        ? {}
+        : { userMessage: text(error.userMessage) }),
+      ...(error.remediationAction === undefined
+        ? {}
+        : { remediationAction: text(error.remediationAction) }),
     });
   return error;
 };
+
+const mirrorCleanup = <Value extends AnalysisError>(
+  source: AnalysisError,
+  redacted: Value,
+  redact: (value: string) => string,
+): Value =>
+  redacted.bindCleanupDependencies([source], {
+    get cleanupResources(): readonly string[] {
+      return source.cleanupResources.map(redact);
+    },
+  });

@@ -3,10 +3,10 @@ import { JavaScriptRecoveryService } from "../application/javascript/JavaScriptR
 import { createJavaScriptRecoveryProvider } from "../composition/javascriptRecovery.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
-import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 import { withCommandCancellation } from "./commandCancellation.js";
+import { finishAnalysisCommand } from "./finishAnalysisCommand.js";
 
 /** Share source recovery with MCP while keeping CLI spelling at this boundary. */
 export const registerJavaScriptRecoveryCommands = (
@@ -27,6 +27,12 @@ export const registerJavaScriptRecoveryCommands = (
       outputDirectory: z.string().describe("Absolute absent output directory"),
     }),
     options: z.object({
+      additionalPath: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Related absolute UTF-8 JavaScript file; repeat for multiple chunks",
+        ),
       extractionMode: z
         .enum(["structural", "heuristic", "inspection"])
         .optional()
@@ -42,27 +48,30 @@ export const registerJavaScriptRecoveryCommands = (
     }),
     run: ({ args, options }) =>
       withCommandCancellation((signal) =>
-        logCliCommand(
-          logger,
-          CLI_COMMANDS.recoverJavaScriptSources,
-          async () => {
-            const result = await service.recover(
-              {
-                path: args.path,
-                output_directory: args.outputDirectory,
-                ...(options.extractionMode === undefined
-                  ? {}
-                  : { extraction_mode: options.extractionMode }),
-                ...(options.rewriteLevel === undefined
-                  ? {}
-                  : { rewrite_level: options.rewriteLevel }),
-              },
-              { signal },
-            );
-            return result.ok
-              ? result.value
-              : projectAnalysisError(result.error);
-          },
+        logCliCommand(logger, CLI_COMMANDS.recoverJavaScriptSources, () =>
+          finishAnalysisCommand(
+            () =>
+              service.recover(
+                {
+                  path: args.path,
+                  output_directory: args.outputDirectory,
+                  ...(options.additionalPath === undefined
+                    ? {}
+                    : { additional_paths: options.additionalPath }),
+                  ...(options.extractionMode === undefined
+                    ? {}
+                    : { extraction_mode: options.extractionMode }),
+                  ...(options.rewriteLevel === undefined
+                    ? {}
+                    : { rewrite_level: options.rewriteLevel }),
+                },
+                { signal },
+              ),
+            service,
+            "wakaru",
+            "recover_javascript_sources",
+            signal,
+          ),
         ),
       ),
   });

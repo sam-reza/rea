@@ -1,37 +1,99 @@
-import {
-  NonRegularFileReadError,
-  openRegularFile,
-  sameRegularFileState,
-} from "../../filesystem/RegularFile.js";
+import { sameRegularFileState } from "../../filesystem/RegularFile.js";
 import type { FileHandle } from "node:fs/promises";
 import type { Stats } from "node:fs";
+import type { StableRegularFileDescriptor } from "../../filesystem/RegularFile.js";
+import type { OwnedFileHandle } from "../../filesystem/OwnedFileHandle.js";
 
-import {
-  classifyArtifactBytes,
-  classifyArtifactContent,
-} from "./ArtifactGraphConstruction.js";
-import { ARTIFACT_CLASSIFICATION_PREFIX_BYTES } from "../ArtifactHash.js";
+import { classifyArtifactContent } from "./ArtifactGraphConstruction.js";
+import { abortIfNeeded } from "../ArtifactHash.js";
+import { createArtifactClassificationProbe } from "../ArtifactClassificationProbe.js";
 import type { ArtifactOccurrence } from "../../domain/artifactGraph.js";
 import {
   hasZipSignature,
+  isZipPackageFormat,
   zipPackageFormatForPath,
+  type ZipPackageFormat,
 } from "../../domain/zipPackageFormat.js";
 import { ArtifactReaderFailure } from "../ArtifactReader.js";
+import type { ArtifactResourceOwner } from "../ArtifactResourceScope.js";
 import type { HashResult } from "../ArtifactHash.js";
-import { hashStableRootArtifactHandle } from "./hashStableRootArtifact.js";
+import {
+  hashStableRootArtifactHandle,
+  openRootArtifact,
+} from "./hashStableRootArtifact.js";
+import type { ArtifactInventoryOptions } from "./types.js";
+
+interface RootClassification {
+  readonly format: ArtifactOccurrence["artifact_format"];
+  readonly digest: HashResult | null;
+}
+
+type RootInventoryClassification = RootClassification & {
+  readonly rootSource: RootInventorySource | undefined;
+};
+
+/** The admitted descriptor and the single owner that can confirm its close. */
+export interface RootInventorySource extends StableRegularFileDescriptor {
+  readonly owner: OwnedFileHandle;
+}
 
 /** Classify and hash one file root through the same stable open descriptor. */
 export const classifyAndHashRoot = async (
   path: string,
   directory: boolean,
   expectedMetadata: Stats,
-  signal?: AbortSignal,
-): Promise<{
-  readonly format: ArtifactOccurrence["artifact_format"];
-  readonly digest: HashResult | null;
-}> => {
-  if (directory) return { format: "directory", digest: null };
-  const handle = await openRootFile(path, signal);
+  options: Pick<ArtifactInventoryOptions, "resourceScope" | "signal">,
+): Promise<RootClassification> => {
+  return options.resourceScope.run(async () => {
+    const result = await classifyAndHashRootForInventory(
+      path,
+      directory,
+      expectedMetadata,
+      options,
+    );
+    const rootSource = result.rootSource;
+    if (rootSource !== undefined) {
+      const owner: ArtifactResourceOwner = {
+        kind: "file-handle",
+        handle: rootSource.owner,
+        resource: `root artifact descriptor for ${path}`,
+      };
+      const cleanupAttempt = await options.resourceScope.release(owner);
+      if (cleanupAttempt.kind === "failed")
+        throw options.resourceScope.cleanupFailure({ kind: "completed" }, [
+          cleanupAttempt,
+        ]);
+    }
+    return { format: result.format, digest: result.digest };
+  });
+};
+
+/** Classify a root and retain its admitted ZIP descriptor for child inventory. */
+export const classifyAndHashRootForInventory = async (
+  path: string,
+  directory: boolean,
+  expectedMetadata: Stats,
+  options: Pick<ArtifactInventoryOptions, "resourceScope" | "signal">,
+): Promise<RootInventoryClassification> => {
+  if (directory)
+    return { format: "directory", digest: null, rootSource: undefined };
+  const ownedHandle = await openRootArtifact(
+    path,
+    options.resourceScope,
+    options.signal,
+  );
+  const handle = ownedHandle.handle;
+  const owner: ArtifactResourceOwner = {
+    kind: "file-handle",
+    handle: ownedHandle,
+    resource: `root artifact descriptor for ${path}`,
+  };
+  let outcome:
+    | {
+        readonly kind: "completed";
+        readonly value: RootInventoryClassification;
+      }
+    | { readonly kind: "failed"; readonly cause: unknown };
   try {
     const initial = await handle.stat();
     if (!sameRegularFileState(expectedMetadata, initial))
@@ -39,80 +101,99 @@ export const classifyAndHashRoot = async (
         "integrity",
         `Root artifact changed before inventory: ${path}`,
       );
-    const format = await classifyRootFormat(path, handle);
+    const format = await classifyRootFormat(path, handle, options.signal);
     const digest = await hashStableRootArtifactHandle(
       path,
       handle,
       initial,
-      signal,
+      options.signal,
     );
-    return { format, digest };
-  } finally {
-    await handle.close();
-  }
-};
-
-const openRootFile = async (
-  path: string,
-  signal?: AbortSignal,
-): Promise<FileHandle> => {
-  try {
-    return await openRegularFile(path, { symlinks: "reject", signal });
+    const retainSource =
+      isZipPackageFormat(format) || format === "mach-o-universal";
+    outcome = {
+      kind: "completed",
+      value: {
+        format,
+        digest,
+        rootSource: retainSource
+          ? { handle, initial, owner: ownedHandle }
+          : undefined,
+      },
+    };
   } catch (cause: unknown) {
-    if (cause instanceof NonRegularFileReadError)
-      throw new ArtifactReaderFailure(
-        "format",
-        `Artifact root is not a regular file: ${path}`,
-        { cause },
-      );
-    throw cause;
+    outcome = { kind: "failed", cause };
   }
+  if (outcome.kind === "failed" || outcome.value.rootSource === undefined) {
+    const cleanupAttempt = await options.resourceScope.release(owner);
+    if (cleanupAttempt.kind === "failed")
+      throw options.resourceScope.cleanupFailure(outcome, [cleanupAttempt]);
+  }
+  if (outcome.kind === "failed") throw outcome.cause;
+  return outcome.value;
 };
 
 const classifyRootFormat = async (
   path: string,
   handle: FileHandle,
+  signal?: AbortSignal,
 ): Promise<ArtifactOccurrence["artifact_format"]> => {
-  const magic = Buffer.alloc(ARTIFACT_CLASSIFICATION_PREFIX_BYTES);
-  const observed = await handle.read(magic, 0, magic.length, 0);
-  const prefix = magic.subarray(0, observed.bytesRead);
+  const probe = createArtifactClassificationProbe();
+  const chunk = Buffer.alloc(64 * 1024);
+  while (probe.length < probe.limit) {
+    abortIfNeeded(signal);
+    const read = await handle.read(
+      chunk,
+      0,
+      Math.min(chunk.length, probe.limit - probe.length),
+      probe.length,
+    );
+    abortIfNeeded(signal);
+    if (read.bytesRead === 0) break;
+    probe.write(chunk.subarray(0, read.bytesRead));
+  }
+  const archiveBytes = (await handle.stat()).size;
+  const evidence = probe.finish(archiveBytes);
+  abortIfNeeded(signal);
   const lower = path.toLowerCase();
-  if (hasZipSignature(prefix)) return zipPackageFormatForPath(lower) ?? "zip";
-  if (lower.endsWith(".asar") && hasAsarHeader(prefix)) return "asar";
+  if (hasZipSignature(evidence.prefix)) return zipRootPackageFormat(lower);
   if (
     lower.endsWith(".pkg") &&
-    prefix.subarray(0, 4).toString("ascii") === "xar!"
+    evidence.prefix.subarray(0, 4).equals(Buffer.from("xar!"))
   )
     return "pkg";
-  if (lower.endsWith(".dmg") && (await hasKolyTrailer(handle))) return "dmg";
-  const size = (await handle.stat()).size;
-  const format = classifyArtifactContent(path, prefix, size).format;
-  // Path suffixes stay role hints for nested members. A root whose container
-  // magic did not match is classified from the bytes that were read.
-  if (format === "asar" || format === "pkg" || format === "dmg")
-    return classifyArtifactBytes(prefix, size);
-  return format;
+  if (
+    lower.endsWith(".dmg") &&
+    (await hasKolyTrailer(handle, archiveBytes, signal))
+  )
+    return "dmg";
+  return classifyArtifactContent(path, evidence, archiveBytes).format;
 };
 
-/**
- * Electron ASAR starts with a size pickle whose payload is one uint32, then
- * a header pickle whose payload begins with a JSON object.
- */
-const hasAsarHeader = (prefix: Buffer): boolean => {
-  if (prefix.length < 16 || prefix.readUInt32LE(0) !== 4) return false;
-  const headerSize = prefix.readUInt32LE(4);
-  const payloadSize = prefix.readUInt32LE(8);
-  if (headerSize < 16 || payloadSize !== headerSize - 4) return false;
-  const stringLength = prefix.readUInt32LE(12);
-  return (
-    stringLength >= 2 && stringLength <= payloadSize - 4 && prefix[16] === 0x7b
-  );
-};
+/** App Pack is a verified ZIP root role; nested .app members retain their observed format. */
+const zipRootPackageFormat = (lower: string): ZipPackageFormat =>
+  lower.endsWith(".app")
+    ? "app-pack"
+    : (zipPackageFormatForPath(lower) ?? "zip");
 
-const hasKolyTrailer = async (handle: FileHandle): Promise<boolean> => {
-  const size = (await handle.stat()).size;
+const hasKolyTrailer = async (
+  handle: FileHandle,
+  size: number,
+  signal?: AbortSignal,
+): Promise<boolean> => {
   if (size < 512) return false;
   const trailer = Buffer.alloc(4);
-  const read = await handle.read(trailer, 0, trailer.length, size - 512);
-  return read.bytesRead === 4 && trailer.toString("ascii") === "koly";
+  let bytes = 0;
+  while (bytes < trailer.length) {
+    abortIfNeeded(signal);
+    const read = await handle.read(
+      trailer,
+      bytes,
+      trailer.length - bytes,
+      size - 512 + bytes,
+    );
+    abortIfNeeded(signal);
+    if (read.bytesRead === 0) return false;
+    bytes += read.bytesRead;
+  }
+  return trailer.equals(Buffer.from("koly"));
 };

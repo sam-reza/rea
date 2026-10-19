@@ -4,6 +4,10 @@ import { z } from "zod";
 
 import { canonicalJson } from "./comparisonSemantics.js";
 import { digestCanonicalValue } from "./canonicalDigest.js";
+import {
+  createReferenceSourcePathLookup,
+  isPortableAbsoluteReferenceTarget,
+} from "./referenceSourcePathIdentity.js";
 import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
 import { digestSchema } from "./../domain/digests.js";
 import { prefixedDigestSchema } from "./../domain/digests.js";
@@ -14,7 +18,7 @@ const relativePathSchema = z
   .refine(
     (path) =>
       !path.startsWith("/") &&
-      !path.includes("\\") &&
+      !path.includes("\0") &&
       path
         .split("/")
         .every((part) => part !== "" && part !== "." && part !== ".."),
@@ -81,17 +85,11 @@ const symlinkTargetSchema = z
   .min(1)
   .refine(
     (target) =>
-      isPortableAbsoluteSymlinkTarget(target) ||
-      (!target.startsWith("/") &&
-        !target.includes("\\") &&
-        posix.normalize(target) === target),
+      !target.includes("\0") &&
+      (isPortableAbsoluteReferenceTarget(target) ||
+        (!target.startsWith("/") && posix.normalize(target) === target)),
     "Expected a normalized POSIX symlink target",
   );
-
-const isPortableAbsoluteSymlinkTarget = (target: string): boolean =>
-  target.startsWith("/") ||
-  /^[A-Za-z]:[\\/]/u.test(target) ||
-  /^\\\\[^\\/]+[\\/][^\\/]+/u.test(target);
 
 const sourceSymlinkSchema = z.union([
   z.strictObject({
@@ -112,6 +110,10 @@ const sourceEntrySchema = z.union([
   sourceFileSchema,
   sourceDirectorySchema,
   sourceSymlinkSchema,
+  z.strictObject({
+    ...entryBaseShape,
+    kind: z.literal("unknown"),
+  }),
 ]);
 
 const sourceRelationshipSchema = z.strictObject({
@@ -128,15 +130,28 @@ const parseFailureSchema = z.strictObject({
   reason: boundedTextSchema,
 });
 
-const exclusionSchema = z.strictObject({
-  path: relativePathSchema,
-  reason: z.enum([
-    "configured-secret",
-    "symlink-escape",
-    "unreadable",
-    "caller-excluded",
-  ]),
-});
+const exclusionSchema = z.discriminatedUnion("reason", [
+  z.strictObject({
+    path: relativePathSchema,
+    entry_kind: z
+      .enum(["file", "directory", "symlink", "other", "unknown"])
+      .exactOptional(),
+    reason: z.enum([
+      "configured-secret",
+      "project-ignored",
+      "default-ignored",
+      "caller-excluded",
+    ]),
+    pattern: boundedTextSchema,
+  }),
+  z.strictObject({
+    path: relativePathSchema,
+    entry_kind: z
+      .enum(["file", "directory", "symlink", "other", "unknown"])
+      .exactOptional(),
+    reason: z.enum(["symlink-escape", "unreadable"]),
+  }),
+]);
 
 const vcsSchema = z
   .discriminatedUnion("kind", [
@@ -313,10 +328,51 @@ const checkSymlinks = (
   paths: ReadonlySet<string>,
   context: z.RefinementCtx,
 ): void => {
+  const lookupPath = createReferenceSourcePathLookup(paths);
+  const excludedPaths = createReferenceSourcePathLookup(
+    graph.exclusions.map(({ path }) => path),
+  );
+  const excludedKinds = new Map<
+    string,
+    Set<"file" | "directory" | "symlink" | "other" | "unknown" | undefined>
+  >();
+  for (const { path, entry_kind } of graph.exclusions) {
+    const kinds = excludedKinds.get(path) ?? new Set();
+    kinds.add(entry_kind);
+    excludedKinds.set(path, kinds);
+  }
   for (const [index, entry] of graph.entries.entries()) {
     if (entry.kind !== "symlink") continue;
     if (entry.target === null) continue;
-    const absolute = isPortableAbsoluteSymlinkTarget(entry.target);
+    const resolved = posix.normalize(
+      posix.join(posix.dirname(entry.path), entry.target),
+    );
+    const escapesRoot = resolved.startsWith("../") || resolved === "..";
+    // The root is implicit; every other internal target needs an exact or
+    // uniquely Unicode-equivalent recorded inventory identity.
+    const inventoried =
+      resolved === "." || lookupPath.resolve(resolved) !== undefined;
+    const exactExcluded = excludedPaths.resolve(resolved);
+    let excluded = exactExcluded !== undefined;
+    for (
+      let candidate = posix.dirname(resolved);
+      candidate !== "." && candidate !== "/";
+      candidate = posix.dirname(candidate)
+    ) {
+      const excludedAncestor = excludedPaths.resolve(candidate);
+      if (excludedAncestor === undefined) continue;
+      const kinds = excludedKinds.get(excludedAncestor);
+      if (kinds?.size !== 1 || !kinds.has("directory")) {
+        excluded = false;
+        break;
+      }
+      excluded = true;
+    }
+    const ownedRelativeTarget =
+      !entry.target.startsWith("/") && !escapesRoot && inventoried;
+    const absolute =
+      isPortableAbsoluteReferenceTarget(entry.target) &&
+      !(entry.target_state === "internal" && ownedRelativeTarget);
     if (
       (entry.target_state === "external" && !absolute) ||
       (entry.target_state === "internal" && absolute)
@@ -327,13 +383,11 @@ const checkSymlinks = (
         path: ["entries", index, "target"],
       });
     if (entry.target_state !== "internal") continue;
-    const resolved = posix.normalize(
-      posix.join(posix.dirname(entry.path), entry.target),
-    );
-    if (resolved.startsWith("../") || resolved === ".." || !paths.has(resolved))
+    if (escapesRoot || (!inventoried && !excluded))
       context.addIssue({
         code: "custom",
-        message: "Internal symlink target must resolve to an inventoried entry",
+        message:
+          "Internal symlink target must resolve to an inventoried entry or a recorded exclusion",
         path: ["entries", index, "target"],
       });
   }
@@ -349,7 +403,8 @@ const checkCompleteInventory = (
       entry.limitations.length > 0 ||
       (entry.kind === "file" && entry.content_state !== "hashed") ||
       (entry.kind === "directory" && entry.tree_state !== "enumerated") ||
-      (entry.kind === "symlink" && entry.target_state !== "internal"),
+      (entry.kind === "symlink" && entry.target_state !== "internal") ||
+      entry.kind === "unknown",
   );
   const partialRelationship = graph.relationships.some(
     ({ parse_state, resolution }) =>
@@ -400,7 +455,10 @@ function checkGraphInvariants(
     context,
   );
   checkSortedUnique(
-    graph.exclusions.map(({ path, reason }) => `${path}\u0000${reason}`),
+    graph.exclusions.map(
+      (exclusion) =>
+        `${exclusion.path}\u0000${exclusion.reason}\u0000${"pattern" in exclusion ? exclusion.pattern : ""}`,
+    ),
     "exclusions",
     context,
   );
@@ -462,6 +520,11 @@ const rootCommitment = (
           path: entry.path,
           target: entry.target,
           target_state: entry.target_state,
+        };
+      case "unknown":
+        return {
+          kind: entry.kind,
+          path: entry.path,
         };
     }
   }),

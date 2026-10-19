@@ -1,10 +1,17 @@
 import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { lstatSync } from "node:fs";
+import { err, ok, type Result } from "../domain/result.js";
 import {
   HermesClientPathError,
   resolveHermesClientHome,
 } from "./HermesClientHome.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
+import { resolveWindowsClaudeDesktopLocation } from "./ClaudeDesktopConfigLocation.js";
+import {
+  type MsixPackageView,
+  windowsAppDataRoots,
+} from "./MsixPackageStorage.js";
 
 /** One supported client configuration location. */
 export interface SetupClient {
@@ -24,9 +31,16 @@ export interface SetupClient {
   };
   /** Unresolved path evidence only; consumers must not perform I/O on it. */
   readonly configPathError?: string;
+  /** Same-scope fallback ZCode stops loading after its first native server. */
+  readonly zcodeFallbackPath?: string;
   readonly markerPath?: string;
+  /** MSIX package storage that decides which configuration the client reads. */
+  readonly msixPackage?: MsixPackageView;
+  /** A running client can rewrite its configuration from memory. */
+  readonly quitBeforeSetup?: boolean;
   readonly format?:
     | "json"
+    | "claude_code"
     | "toml"
     | "vscode"
     | "copilot_cli"
@@ -35,11 +49,23 @@ export interface SetupClient {
     | "grok"
     | "omp"
     | "pi"
+    | "kimi"
     | "hermes"
+    | "zcode_fallback"
+    | "zcode"
+    | "dsh"
     | "unsupported";
 }
 
-type ClientPath = readonly string[] | ((paths: ClientPathContext) => string);
+interface ClientPathFailure {
+  readonly path: string;
+  readonly message: string;
+}
+
+type ClientPathResult = Result<string, ClientPathFailure>;
+type ClientPath =
+  | readonly string[]
+  | ((paths: ClientPathContext) => string | ClientPathResult);
 
 interface ClientPathContext {
   readonly home: string;
@@ -47,12 +73,36 @@ interface ClientPathContext {
   readonly env: Readonly<NodeJS.ProcessEnv>;
 }
 
-interface ClientDefinition {
+/** One resolved configuration location and its detection evidence. */
+interface ClientLocation {
+  readonly configPath: string;
+  readonly markerPath: string;
+  readonly msixPackage?: MsixPackageView;
+}
+
+type ClientDefinition = ClientDefinitionBase &
+  (
+    | {
+        readonly configPath: ClientPath;
+        readonly markerPath: ClientPath;
+        readonly location?: undefined;
+      }
+    | {
+        /** Resolve configuration and marker together when they share probes. */
+        readonly location: (
+          context: ClientPathContext,
+        ) => Result<ClientLocation, ClientPathFailure>;
+        readonly configPath?: undefined;
+        readonly markerPath?: undefined;
+      }
+  );
+
+interface ClientDefinitionBase {
   readonly name: string;
   readonly displayName: string;
-  readonly configPath: ClientPath;
-  readonly markerPath: ClientPath;
   readonly format: NonNullable<SetupClient["format"]>;
+  readonly quitBeforeSetup?: boolean;
+  readonly zcodeFallbackPath?: (context: ClientPathContext) => string;
   readonly skillPath?: ClientPath;
   readonly configPaths?: (context: ClientPathContext) => readonly string[];
   readonly geminiSettings?: (
@@ -60,42 +110,68 @@ interface ClientDefinition {
   ) => NonNullable<SetupClient["geminiSettings"]>;
 }
 
+/** XDG treats an empty config-home value as unset. */
+const xdgConfigHome = ({ home, env }: ClientPathContext): string =>
+  env.XDG_CONFIG_HOME || join(home, ".config");
+
 const vscodeUserDirectory = ({
   home,
   platform,
   env,
 }: ClientPathContext): string => {
   if (platform === "win32")
-    return join(
-      env.APPDATA ?? join(home, "AppData", "Roaming"),
-      "Code",
-      "User",
-    );
+    return join(windowsAppDataRoots(home, env).roaming, "Code", "User");
   if (platform === "darwin")
     return join(home, "Library", "Application Support", "Code", "User");
-  return join(env.XDG_CONFIG_HOME ?? join(home, ".config"), "Code", "User");
+  return join(xdgConfigHome({ home, platform, env }), "Code", "User");
 };
 
-const claudeDesktopDirectory = ({
+const traeUserDirectory = ({
   home,
   platform,
   env,
 }: ClientPathContext): string => {
   if (platform === "win32")
-    return join(env.APPDATA ?? join(home, "AppData", "Roaming"), "Claude");
-  if (platform === "linux")
-    return join(env.XDG_CONFIG_HOME ?? join(home, ".config"), "Claude");
-  return join(home, "Library", "Application Support", "Claude");
+    return join(windowsAppDataRoots(home, env).roaming, "Trae", "User");
+  if (platform === "darwin")
+    return join(home, "Library", "Application Support", "Trae", "User");
+  return join(xdgConfigHome({ home, platform, env }), "Trae", "User");
+};
+
+/** Windows packaging decides which file Claude Desktop reads; see its resolver. */
+const claudeDesktopLocation = (
+  context: ClientPathContext,
+): Result<ClientLocation, ClientPathFailure> => {
+  if (context.platform === "win32")
+    return resolveWindowsClaudeDesktopLocation(context.home, context.env);
+  const directory =
+    context.platform === "linux"
+      ? join(xdgConfigHome(context), "Claude")
+      : join(context.home, "Library", "Application Support", "Claude");
+  return ok({
+    configPath: join(directory, "claude_desktop_config.json"),
+    markerPath: directory,
+  });
 };
 
 const claudeCodeConfigDirectory = ({ home, env }: ClientPathContext): string =>
-  env.CLAUDE_CONFIG_DIR ?? home;
+  env.CLAUDE_CONFIG_DIR || home;
 
 const claudeCodeMarkerDirectory = ({ home, env }: ClientPathContext): string =>
-  env.CLAUDE_CONFIG_DIR ?? join(home, ".claude");
+  env.CLAUDE_CONFIG_DIR || join(home, ".claude");
 
 const codexDirectory = ({ home, env }: ClientPathContext): string =>
   env.CODEX_HOME || join(home, ".codex");
+
+/** Kimi Code stores MCP declarations beside the rest of its home data. */
+const kimiDirectory = ({ home, env }: ClientPathContext): string =>
+  env.KIMI_CODE_HOME || join(home, ".kimi-code");
+
+const qoderDirectory = ({ home, env }: ClientPathContext): string =>
+  env.QODER_CONFIG_DIR || join(home, ".qoder");
+
+const factoryDirectory = ({ home }: ClientPathContext): string =>
+  join(home, ".factory");
 
 /** Match Qwen Code's home override, including tilde and cwd-relative paths. */
 const qwenCodeDirectory = ({ home, env }: ClientPathContext): string => {
@@ -118,6 +194,31 @@ const qwenCodeDirectory = ({ home, env }: ClientPathContext): string => {
 
 const grokDirectory = ({ home, env }: ClientPathContext): string =>
   env.GROK_HOME || join(home, ".grok");
+
+/** Match Harness home-paths for both independent roots; trim only to detect blanks. */
+const dshDirectory = (
+  home: string,
+  override: string | undefined,
+  fallback: string,
+): string => {
+  const selected =
+    override !== undefined && override.trim().length > 0
+      ? override
+      : join(home, fallback);
+  const expanded =
+    selected === "~"
+      ? home
+      : selected.startsWith("~/") || selected.startsWith("~\\")
+        ? join(home, selected.slice(2))
+        : selected;
+  return resolve(expanded);
+};
+
+const dshHomeDirectory = ({ home, env }: ClientPathContext): string =>
+  dshDirectory(home, env.DSH_HOME, ".dsh");
+
+const dshPatchDirectory = (context: ClientPathContext): string =>
+  join(dshHomeDirectory(context), "cordis.patch.yml");
 
 const hermesDirectory = ({ home, platform, env }: ClientPathContext): string =>
   resolveHermesClientHome(home, platform, env);
@@ -145,35 +246,82 @@ export const manualRegistrationRemediation = (
     ? GROK_BOT_MANUAL_REGISTRATION_REMEDIATION
     : undefined;
 
-const OMP_PROFILE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
+/**
+ * Facts a setup plan must disclose so an approved registration persists:
+ * which file an MSIX package reads, and that a running client can overwrite it.
+ */
+export const registrationPersistenceDetail = (
+  client: SetupClient,
+): string | undefined => {
+  const name = client.displayName ?? client.name;
+  const msix = client.msixPackage;
+  const packageDetail =
+    msix === undefined
+      ? undefined
+      : client.configPath === msix.privateConfigPath
+        ? `${name} is installed as MSIX package ${msix.packageFamilyName}, which reads this package-private file instead of ${msix.appDataConfigPath}.`
+        : `${name} is installed as MSIX package ${msix.packageFamilyName}, which reads this file until it saves its own copy at ${msix.privateConfigPath}.`;
+  const quitDetail =
+    client.quitBeforeSetup === true
+      ? `Quit ${name} fully before approving; closing its window is not enough. A running ${name} can rewrite this file from memory and drop the registration. Start it again after setup.`
+      : undefined;
+  const details = [packageDetail, quitDetail].filter(
+    (detail): detail is string => detail !== undefined,
+  );
+  return details.length === 0 ? undefined : details.join(" ");
+};
 
 /**
- * OMP's active named profile. OMP_PROFILE wins over the legacy PI_PROFILE even
- * when empty; empty and "default" select the default profile. OMP refuses to
- * start with an invalid name, so one leaves the default location in place.
+ * Why this process must not change an MSIX client's configuration. A process
+ * the running app started sees its redirected AppData, and the app would
+ * overwrite the change from memory; an unknown view cannot rule that out.
  */
-const ompProfile = ({ env }: ClientPathContext): string | undefined => {
-  const name = (env.OMP_PROFILE ?? env.PI_PROFILE)?.trim();
-  return name === undefined ||
-    name === "" ||
-    name === "default" ||
-    name.endsWith(".") ||
-    !OMP_PROFILE_NAME.test(name)
-    ? undefined
-    : name;
+export const registrationWriteBlocker = (
+  client: SetupClient,
+  operation: "setup" | "uninstall",
+): string | undefined => {
+  const msix = client.msixPackage;
+  if (msix === undefined || msix.processView === "direct") return undefined;
+  const name = client.displayName ?? client.name;
+  return msix.processView === "redirected"
+    ? `This process was started from ${name}'s MSIX package ${msix.packageFamilyName}: its AppData is redirected into that package, so ${name} is running and would overwrite ${msix.privateConfigPath} from memory. Quit ${name} fully, then rerun ${operation} from a terminal that ${name} did not start.`
+    : `REA cannot tell whether ${name}'s MSIX package ${msix.packageFamilyName} started this process, because none of its files under ${dirname(msix.privateConfigPath)} could be compared with ${dirname(msix.appDataConfigPath)}. A running ${name} would overwrite the change. Open ${name} once if it has never run, quit it fully, then rerun ${operation} from a terminal that ${name} did not start.`;
 };
+
+/** The MSIX package view, if any, that redirects this process's AppData writes. */
+export const appDataRedirection = (
+  clients: readonly SetupClient[],
+): MsixPackageView | undefined =>
+  clients.find(({ msixPackage }) => msixPackage?.processView === "redirected")
+    ?.msixPackage;
+
+const OMP_PROFILE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
+const OMP_RESERVED_PROFILE =
+  /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?$/iu;
 
 /**
  * The OMP agent directory whose `mcp.json` holds user-scope MCP servers. OMP
  * joins PI_CONFIG_DIR to the home directory, and a named profile ignores
  * PI_CODING_AGENT_DIR. Relative overrides use the setup process working directory.
  */
-const ompAgentDirectory = (context: ClientPathContext): string => {
+const ompAgentDirectory = (context: ClientPathContext): ClientPathResult => {
   const root = join(context.home, context.env.PI_CONFIG_DIR || ".omp");
-  const profile = ompProfile(context);
-  if (profile !== undefined) return join(root, "profiles", profile, "agent");
+  // OMP_PROFILE wins even when empty. Match OMP's validation on every host.
+  const profile = (context.env.OMP_PROFILE ?? context.env.PI_PROFILE)?.trim();
+  if (profile !== undefined && profile !== "" && profile !== "default") {
+    if (
+      !OMP_PROFILE_NAME.test(profile) ||
+      profile.endsWith(".") ||
+      OMP_RESERVED_PROFILE.test(profile)
+    )
+      return err({
+        path: root,
+        message: `Invalid OMP profile ${JSON.stringify(profile)}: names must match ^[a-z0-9][a-z0-9._-]{0,63}$, cannot end with ".", and cannot be a Windows reserved device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, including extensions). Repair OMP_PROFILE or PI_PROFILE before configuring OMP.`,
+      });
+    return ok(join(root, "profiles", profile, "agent"));
+  }
   const override = context.env.PI_CODING_AGENT_DIR;
-  return override ? resolve(override) : join(root, "agent");
+  return ok(override ? resolve(override) : join(root, "agent"));
 };
 
 /**
@@ -230,19 +378,13 @@ const openCodeOverrideDirectory = (
 
 const opencodeDirectory = (context: ClientPathContext): string =>
   openCodeOverrideDirectory(context.env) ??
-  join(
-    context.env.XDG_CONFIG_HOME ?? join(context.home, ".config"),
-    "opencode",
-  );
+  join(xdgConfigHome(context), "opencode");
 
 /** OpenCode loads global JSON before JSONC, then explicit file and directory overrides. */
 const openCodeConfigurationPaths = (
   context: ClientPathContext,
 ): readonly string[] => {
-  const directory = join(
-    context.env.XDG_CONFIG_HOME ?? join(context.home, ".config"),
-    "opencode",
-  );
+  const directory = join(xdgConfigHome(context), "opencode");
   const overrideDirectory = openCodeOverrideDirectory(context.env);
   const paths = [
     join(directory, "config.json"),
@@ -332,7 +474,7 @@ const geminiSettings = ({
 
 const devinDirectory = ({ home, platform, env }: ClientPathContext): string =>
   platform === "win32"
-    ? join(env.APPDATA ?? join(home, "AppData", "Roaming"), "devin")
+    ? join(windowsAppDataRoots(home, env).roaming, "devin")
     : join(env.XDG_CONFIG_HOME || join(home, ".config"), "devin");
 
 /** Stable product metadata used to derive setup discovery and documentation. */
@@ -340,19 +482,18 @@ export const SUPPORTED_CLIENT_DEFINITIONS = [
   {
     name: "claude_code",
     displayName: "Claude Code",
-    skillPath: ({ home, env }: ClientPathContext) =>
-      join(env.CLAUDE_CONFIG_DIR ?? join(home, ".claude"), "skills"),
+    skillPath: (context: ClientPathContext) =>
+      join(claudeCodeMarkerDirectory(context), "skills"),
     configPath: (context: ClientPathContext) =>
       join(claudeCodeConfigDirectory(context), ".claude.json"),
     markerPath: claudeCodeMarkerDirectory,
-    format: "json",
+    format: "claude_code",
   },
   {
     name: "claude_desktop",
     displayName: "Claude Desktop",
-    configPath: (context: ClientPathContext) =>
-      join(claudeDesktopDirectory(context), "claude_desktop_config.json"),
-    markerPath: claudeDesktopDirectory,
+    location: claudeDesktopLocation,
+    quitBeforeSetup: true,
     format: "json",
   },
   {
@@ -438,12 +579,37 @@ export const SUPPORTED_CLIENT_DEFINITIONS = [
     format: "json",
   },
   {
+    name: "kimi",
+    displayName: "Kimi Code",
+    configPath: (context: ClientPathContext) =>
+      join(kimiDirectory(context), "mcp.json"),
+    markerPath: kimiDirectory,
+    format: "kimi",
+  },
+  {
     name: "vscode",
     displayName: "VS Code",
     configPath: (context: ClientPathContext) =>
       join(vscodeUserDirectory(context), "mcp.json"),
     markerPath: vscodeUserDirectory,
     format: "vscode",
+  },
+  {
+    name: "trae",
+    displayName: "Trae",
+    skillPath: [".trae", "skills"],
+    configPath: (context: ClientPathContext) =>
+      join(traeUserDirectory(context), "mcp.json"),
+    markerPath: traeUserDirectory,
+    format: "json",
+  },
+  {
+    name: "workbuddy",
+    displayName: "WorkBuddy",
+    skillPath: [".workbuddy", "skills"],
+    configPath: [".workbuddy", "mcp.json"],
+    markerPath: [".workbuddy"],
+    format: "json",
   },
   {
     name: "grok_build",
@@ -456,8 +622,10 @@ export const SUPPORTED_CLIENT_DEFINITIONS = [
   {
     name: "omp",
     displayName: "OMP",
-    configPath: (context: ClientPathContext) =>
-      join(ompAgentDirectory(context), "mcp.json"),
+    configPath: (context: ClientPathContext) => {
+      const directory = ompAgentDirectory(context);
+      return directory.ok ? ok(join(directory.value, "mcp.json")) : directory;
+    },
     markerPath: ompAgentDirectory,
     format: "omp",
   },
@@ -481,6 +649,47 @@ export const SUPPORTED_CLIENT_DEFINITIONS = [
       join(hermesDirectory(context), "config.yaml"),
     markerPath: hermesDirectory,
     format: "hermes",
+  },
+  {
+    name: "qoder",
+    displayName: "Qoder",
+    skillPath: (context: ClientPathContext) =>
+      join(qoderDirectory(context), "skills"),
+    configPath: (context: ClientPathContext) =>
+      join(qoderDirectory(context), "settings.json"),
+    markerPath: qoderDirectory,
+    format: "json",
+  },
+  {
+    name: "droid",
+    displayName: "Factory Droid",
+    skillPath: (context: ClientPathContext) =>
+      join(factoryDirectory(context), "skills"),
+    configPath: (context: ClientPathContext) =>
+      join(factoryDirectory(context), "mcp.json"),
+    markerPath: factoryDirectory,
+    format: "json",
+  },
+  {
+    name: "zcode",
+    zcodeFallbackPath: ({ home }: ClientPathContext) =>
+      join(home, ".agents", "mcp.json"),
+    displayName: "ZCode",
+    configPath: [".zcode", "cli", "config.json"],
+    markerPath: [".zcode", "cli"],
+    skillPath: [".zcode", "skills"],
+    format: "zcode",
+  },
+  {
+    name: "dsh",
+    displayName: "DeepSeek Harness",
+    // The home Cordis patch applies to every profile; the skill directory is
+    // shared agent storage Harness discovers.
+    skillPath: ({ home, env }: ClientPathContext) =>
+      join(dshDirectory(home, env.DSH_AGENTS_HOME, ".agents"), "skills"),
+    configPath: dshPatchDirectory,
+    markerPath: dshHomeDirectory,
+    format: "dsh",
   },
   {
     name: "grok_bot",
@@ -508,8 +717,27 @@ export const clientEvidencePaths = (
   ),
 ];
 
-const resolvePath = (path: ClientPath, context: ClientPathContext): string =>
-  typeof path === "function" ? path(context) : join(context.home, ...path);
+const resolvePath = (
+  path: ClientPath,
+  context: ClientPathContext,
+): ClientPathResult => {
+  const resolved =
+    typeof path === "function" ? path(context) : join(context.home, ...path);
+  return typeof resolved === "string" ? ok(resolved) : resolved;
+};
+
+const resolveLocation = (
+  definition: ClientDefinition,
+  context: ClientPathContext,
+): Result<ClientLocation, ClientPathFailure> => {
+  if (definition.location !== undefined) return definition.location(context);
+  const config = resolvePath(definition.configPath, context);
+  if (!config.ok) return config;
+  const marker = resolvePath(definition.markerPath, context);
+  return marker.ok
+    ? ok({ configPath: config.value, markerPath: marker.value })
+    : marker;
+};
 
 /** Describe every client location that setup, doctor, or uninstall may inspect. */
 export const supportedClients = (
@@ -521,7 +749,16 @@ export const supportedClients = (
   const definitions: readonly ClientDefinition[] = SUPPORTED_CLIENT_DEFINITIONS;
   return definitions.map((definition) => {
     try {
-      const configPath = resolvePath(definition.configPath, context);
+      const location = resolveLocation(definition, context);
+      if (!location.ok)
+        return {
+          name: definition.name,
+          displayName: definition.displayName,
+          format: definition.format,
+          configPath: location.error.path,
+          configPathError: location.error.message,
+        };
+      const { configPath, markerPath, msixPackage } = location.value;
       return {
         name: definition.name,
         displayName: definition.displayName,
@@ -536,7 +773,14 @@ export const supportedClients = (
                 ...new Set([...definition.configPaths(context), configPath]),
               ],
             }),
-        markerPath: resolvePath(definition.markerPath, context),
+        ...(definition.zcodeFallbackPath === undefined
+          ? {}
+          : { zcodeFallbackPath: definition.zcodeFallbackPath(context) }),
+        markerPath,
+        ...(msixPackage === undefined ? {} : { msixPackage }),
+        ...(definition.quitBeforeSetup === true
+          ? { quitBeforeSetup: true }
+          : {}),
         format: definition.format,
       };
     } catch (cause: unknown) {
@@ -584,14 +828,16 @@ export const clientSkillDirectories = (
     const definition = definitions.find(({ name }) => name === client);
     let directory: string;
     try {
-      directory =
+      const resolved =
         definition?.skillPath === undefined
-          ? join(home, ".agents", "skills")
+          ? ok(join(home, ".agents", "skills"))
           : resolvePath(definition.skillPath, {
               home,
               platform,
               env: environment,
             });
+      if (!resolved.ok) continue;
+      directory = resolved.value;
     } catch (cause: unknown) {
       // Registration diagnostics own an unresolved profile; never fall back to another skill root.
       if (cause instanceof HermesClientPathError) continue;
@@ -605,6 +851,6 @@ export const clientSkillDirectories = (
       });
   }
   return [...destinations.values()].sort((left, right) =>
-    left.directory.localeCompare(right.directory),
+    compareUnicodeCodePoints(left.directory, right.directory),
   );
 };
